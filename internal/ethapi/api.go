@@ -19,6 +19,7 @@ package ethapi
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -920,6 +921,116 @@ func DoCall(ctx context.Context, b Backend, args CallArgs, blockNrOrHash rpc.Blo
 	return result, nil
 }
 
+// DoCallEx extends DoCall to retrieve the evm debug trace and logs
+func DoCallEx(ctx context.Context, b Backend, args CallArgs, blockNrOrHash rpc.BlockNumberOrHash, overrides *StateOverride, timeout time.Duration, globalGasCap uint64, debug bool, needLogs bool) (*core.ExecutionResult, []byte, []byte, error) {
+	defer func(start time.Time) { log.Debug("Executing EVM call finished", "runtime", time.Since(start)) }(time.Now())
+
+	state, header, err := b.StateAndHeaderByNumberOrHash(ctx, blockNrOrHash)
+	if state == nil || err != nil {
+		return nil, nil, nil, err
+	}
+	if err := overrides.Apply(state); err != nil {
+		return nil, nil, nil, err
+	}
+	// Setup context so it may be cancelled the call has completed
+	// or, in case of unmetered gas, setup a context with a timeout.
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	// Make sure the context is cancelled when the call has completed
+	// this makes sure resources are cleaned up.
+	defer cancel()
+
+	// Get a new instance of the EVM.
+	msg := args.ToMessage(globalGasCap)
+
+	// Build debug tracer if debug mode enabled
+	var debugLogger *vm.StructLogger
+	if debug {
+		debugLogger = vm.NewStructLogger(nil)
+	}
+
+	evm, vmError, err := b.GetEVM(ctx, msg, state, header, &vm.Config{Debug: debug, Tracer: debugLogger})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	// Wait for the context to be done and cancel the evm. Even if the
+	// EVM has finished, cancelling may be done (repeatedly)
+	gopool.Submit(func() {
+		<-ctx.Done()
+		evm.Cancel()
+	})
+
+	// Execute the message.
+	gp := new(core.GasPool).AddGas(math.MaxUint64)
+	result, err := core.ApplyMessage(evm, msg, gp)
+	if err := vmError(); err != nil {
+		return nil, nil, nil, err
+	}
+
+	// If the timer caused an abort, return an appropriate error message
+	if evm.Cancelled() {
+		return nil, nil, nil, fmt.Errorf("execution aborted (timeout = %v)", timeout)
+	}
+	if err != nil {
+		return result, nil, nil, fmt.Errorf("err: %w (supplied gas %d)", err, msg.Gas())
+	}
+
+	var trace []byte
+	var logs []byte
+
+	// Get the evm debug trace
+	if debug {
+		trace, err = getDebugTrace(debugLogger)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+	}
+
+	// Get evm call logs
+	if needLogs {
+		logs, err = getLogs(state)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+	}
+
+	return result, trace, logs, nil
+}
+
+// getDebugTrace gets the evm debug trace
+func getDebugTrace(debugLogger *vm.StructLogger) (trace []byte, err error) {
+	logs := debugLogger.StructLogs()
+	for _, log := range logs {
+		encodedLog, err := json.Marshal(log)
+		if err != nil {
+			return nil, err
+		}
+
+		trace = append(trace, encodedLog...)
+	}
+
+	return
+}
+
+// getLogs gets the evm call logs from state db
+func getLogs(state *state.StateDB) (logs []byte, err error) {
+	stateLogs := state.Logs()
+	for _, log := range stateLogs {
+		encodedLog, err := json.Marshal(log)
+		if err != nil {
+			return nil, err
+		}
+
+		logs = append(logs, encodedLog...)
+	}
+
+	return
+}
+
 func newRevertError(result *core.ExecutionResult) *revertError {
 	reason, errUnpack := abi.UnpackRevert(result.Revert())
 	err := errors.New("execution reverted")
@@ -966,6 +1077,32 @@ func (s *PublicBlockChainAPI) Call(ctx context.Context, args CallArgs, blockNrOr
 		return nil, newRevertError(result)
 	}
 	return result.Return(), result.Err
+}
+
+// CallEx extends Call to retrieve the evm debug trace and logs
+func (s *PublicBlockChainAPI) CallEx(ctx context.Context, args CallArgs, blockNrOrHash rpc.BlockNumberOrHash, overrides *StateOverride, debug bool, needLogs bool) (hexutil.Bytes, error) {
+	result, trace, logs, err := DoCallEx(ctx, s.b, args, blockNrOrHash, overrides, UnHealthyTimeout, s.b.RPCGasCap(), debug, needLogs)
+	if err != nil {
+		return nil, err
+	}
+	// If the result contains a revert reason, try to unpack and return it.
+	if len(result.Revert()) > 0 {
+		return nil, newRevertError(result)
+	}
+
+	if result.Err != nil {
+		return result.Return(), result.Err
+	}
+
+	// Build ExecutionResultEx
+	resultEx := ExecutionResultEx{
+		GasUsed:    result.UsedGas,
+		ReturnData: result.ReturnData,
+		DebugTrace: trace,
+		Logs:       logs,
+	}
+
+	return json.Marshal(resultEx)
 }
 
 func DoEstimateGas(ctx context.Context, b Backend, args CallArgs, blockNrOrHash rpc.BlockNumberOrHash, gasCap uint64) (hexutil.Uint64, error) {
@@ -2476,4 +2613,12 @@ func toHexSlice(b [][]byte) []string {
 		r[i] = hexutil.Encode(b[i])
 	}
 	return r
+}
+
+// ExecutionResultEx is a struct which extends ExecutionResult with debug trace and logs, and removes the Err field
+type ExecutionResultEx struct {
+	GasUsed    uint64 `json:"gasUsed"`
+	ReturnData []byte `json:"returnData"`
+	DebugTrace []byte `json:"debugTrace"`
+	Logs       []byte `json:"logs"`
 }
