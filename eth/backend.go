@@ -240,7 +240,7 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		EventMux:               eth.eventMux,
 		Checkpoint:             checkpoint,
 		Whitelist:              config.Whitelist,
-		TrustedNodes:           eth.p2pServer.TrustedNodes,
+		WhitelistNodes:         eth.whitelistNodes(),
 		DirectBroadcast:        config.DirectBroadcast,
 		DiffSync:               config.DiffSync,
 		DisablePeerTxBroadcast: config.DisablePeerTxBroadcast,
@@ -598,4 +598,15 @@ func (s *Ethereum) Stop() error {
 	s.eventMux.Stop()
 
 	return nil
+}
+
+// whitelistNodes gets the whitelisted nodes which include bootstrap nodes, static nodes and trusted nodes.
+func (s *Ethereum) whitelistNodes() []*enode.Node {
+	nodes := make([]*enode.Node, 0)
+
+	nodes = append(nodes, s.p2pServer.BootstrapNodes...)
+	nodes = append(nodes, s.p2pServer.StaticNodes...)
+	nodes = append(nodes, s.p2pServer.TrustedNodes...)
+
+	return nodes
 }
